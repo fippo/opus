@@ -289,10 +289,14 @@ void opus_custom_decoder_destroy(CELTDecoder *st)
    The scalar memory can be read back as mv[0] after the last block. */
 static OPUS_INLINE void deemphasis_carry(celt_sig *mv, celt_sig m, opus_val16 coef0)
 {
+   celt_sig c1, c2, c3;
+   c1 = coef0;
+   c2 = c1*coef0;
+   c3 = c2*coef0;
    mv[0] = m;
-   mv[1] = coef0*m;
-   mv[2] = coef0*mv[1];
-   mv[3] = coef0*mv[2];
+   mv[1] = c1*m;
+   mv[2] = c2*m;
+   mv[3] = c3*m;
 }
 
 /* Applies the de-emphasis filter to DEEMPH_BLOCK samples at a time, with the
@@ -300,10 +304,14 @@ static OPUS_INLINE void deemphasis_carry(celt_sig *mv, celt_sig m, opus_val16 co
    on the serial dependency chain. The scalar version is latency-bound on the
    x[j] -> m -> x[j+1] chain; this form lets the compiler pipeline (and
    vectorize) everything else.
-   Like the aarch64 NEON kernel, the filter memory is carried across blocks
-   as the vector mv[k] = c^k * m, so the outputs are the lane-wise
-   out[k] = s_k + mv[k] and the carry update is the broadcast
-   mv[k] = c^(k+1) * out[3].
+   The block is structured lane-for-lane like the aarch64 NEON kernel in
+   celt_neon_aarch64.S: the filter memory is carried across blocks as the
+   vector mv[k] = c^k * m, the shifted c^i * x columns are accumulated into
+   it (the fmla v0, v5/v6/v7 staircase), x is added last (fadd v1, v1, v0),
+   and the carry update is the broadcast mv[k] = c^(k+1) * out[3]
+   (fmul v0, v4, v2.s[3]). The remaining differences from the asm are
+   VERY_SMALL, which the asm does not add, and FMA contraction, which is up
+   to the compiler here.
    Only used for float, where SATURATE() is a no-op; the fixed-point path
    would need to saturate at every step. */
 static OPUS_INLINE void deemphasis_block(celt_sig * OPUS_RESTRICT out,
@@ -312,24 +320,25 @@ static OPUS_INLINE void deemphasis_block(celt_sig * OPUS_RESTRICT out,
 {
    celt_sig c1, c2, c3, c4;
    celt_sig x0, x1, x2, x3;
-   celt_sig s0, s1, s2, s3;
+   celt_sig a0, a1, a2, a3;
    c1 = coef0;
    c2 = c1*coef0;
    c3 = c2*coef0;
-   c4 = c3*coef0;
+   /* c2*c2 rather than c3*coef0, matching the asm's fmul s19, s17, s17. */
+   c4 = c2*c2;
    /* Add VERY_SMALL to x[] first to reduce dependency chain. */
    x0 = x[0] + VERY_SMALL;
    x1 = x[1] + VERY_SMALL;
    x2 = x[2] + VERY_SMALL;
    x3 = x[3] + VERY_SMALL;
-   s0 = x0;
-   s1 = x1 + c1*x0;
-   s2 = x2 + c1*x1 + c2*x0;
-   s3 = x3 + c1*x2 + c2*x1 + c3*x0;
-   out[0] = s0 + mv[0];
-   out[1] = s1 + mv[1];
-   out[2] = s2 + mv[2];
-   out[3] = s3 + mv[3];
+   a0 = mv[0];
+   a1 = mv[1] + c1*x0;
+   a2 = mv[2] + c2*x0 + c1*x1;
+   a3 = mv[3] + c3*x0 + c2*x1 + c1*x2;
+   out[0] = x0 + a0;
+   out[1] = x1 + a1;
+   out[2] = x2 + a2;
+   out[3] = x3 + a3;
    mv[0] = c1*out[3];
    mv[1] = c2*out[3];
    mv[2] = c3*out[3];
