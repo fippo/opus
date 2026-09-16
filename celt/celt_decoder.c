@@ -346,11 +346,16 @@ static OPUS_INLINE void deemphasis_block(celt_sig * OPUS_RESTRICT out,
 }
 #endif
 
-/* Single-channel de-emphasis scalar reference (mono, downsample==1, !accum).
-   Matches the inner loop used inside deemphasis() below; non-static so the
-   runtime dispatch table can take its address. */
-opus_val32 celt_deemphasis_c(opus_res *y, const opus_val32 *x, opus_val16 coef0,
-      opus_val32 m, int N)
+/* Runs the whole de-emphasis filter over N samples, writing the result at
+   the given stride and optionally accumulating into y. stride and accum are
+   compile-time constants at every call site, so each call specializes to a
+   branch-free loop. In float builds the bulk of the samples go through
+   deemphasis_block(), with the scalar recurrence only handling the last
+   N%DEEMPH_BLOCK samples; in fixed-point builds only the scalar recurrence
+   is used. */
+static OPUS_INLINE celt_sig deemph_loop(opus_res * OPUS_RESTRICT y,
+      const celt_sig * OPUS_RESTRICT x, celt_sig m, opus_val16 coef0, int N,
+      int stride, int accum)
 {
    int j;
    j=0;
@@ -364,7 +369,12 @@ opus_val32 celt_deemphasis_c(opus_res *y, const opus_val32 *x, opus_val16 coef0,
          int k;
          deemphasis_block(t, x+j, mv, coef0);
          for (k=0;k<DEEMPH_BLOCK;k++)
-            y[j+k] = SIG2RES(t[k]);
+         {
+            if (accum)
+               y[(j+k)*stride] = ADD_RES(y[(j+k)*stride], SIG2RES(t[k]));
+            else
+               y[(j+k)*stride] = SIG2RES(t[k]);
+         }
       }
       m = mv[0];
    }
@@ -373,18 +383,36 @@ opus_val32 celt_deemphasis_c(opus_res *y, const opus_val32 *x, opus_val16 coef0,
    {
       celt_sig tmp = SATURATE(x[j] + VERY_SMALL + m, SIG_SAT);
       m = MULT16_32_Q15(coef0, tmp);
-      y[j] = SIG2RES(tmp);
+      if (accum)
+         y[j*stride] = ADD_RES(y[j*stride], SIG2RES(tmp));
+      else
+         y[j*stride] = SIG2RES(tmp);
    }
    return m;
 }
 
+/* Single-channel de-emphasis scalar reference (mono, downsample==1, !accum).
+   Matches the inner loop used inside deemphasis() below; non-static so the
+   runtime dispatch table can take its address. */
+opus_val32 celt_deemphasis_c(opus_res *y, const opus_val32 *x, opus_val16 coef0,
+      opus_val32 m, int N)
+{
+   return deemph_loop(y, x, m, coef0, N, 1, 0);
+}
+
 /* Special case for stereo with no downsampling and no accumulation. This is
-   quite common and we can make it faster by processing both channels in the
-   same loop, reducing overhead due to the dependency loop in the IIR filter.
+   quite common and, in fixed point, we can make it faster by processing both
+   channels in the same loop, interleaving the two dependency chains of the
+   IIR filter. In float the block form of deemph_loop() already keeps the
+   dependency chain off the critical path, so one pass per channel is enough.
    Non-static so the runtime dispatch table can take its address. */
 void deemphasis_stereo_simple_c(celt_sig *in[], opus_res *pcm, int N, opus_val16 coef0,
       celt_sig *mem)
 {
+#ifndef FIXED_POINT
+   mem[0] = deemph_loop(pcm,   in[0], mem[0], coef0, N, 2, 0);
+   mem[1] = deemph_loop(pcm+1, in[1], mem[1], coef0, N, 2, 0);
+#else
    celt_sig * OPUS_RESTRICT x0;
    celt_sig * OPUS_RESTRICT x1;
    celt_sig m0, m1;
@@ -393,29 +421,7 @@ void deemphasis_stereo_simple_c(celt_sig *in[], opus_res *pcm, int N, opus_val16
    x1=in[1];
    m0 = mem[0];
    m1 = mem[1];
-   j=0;
-#ifndef FIXED_POINT
-   {
-      celt_sig mv0[DEEMPH_BLOCK], mv1[DEEMPH_BLOCK];
-      deemphasis_carry(mv0, m0, coef0);
-      deemphasis_carry(mv1, m1, coef0);
-      for (;j+DEEMPH_BLOCK<=N;j+=DEEMPH_BLOCK)
-      {
-         celt_sig t0[DEEMPH_BLOCK], t1[DEEMPH_BLOCK];
-         int k;
-         deemphasis_block(t0, x0+j, mv0, coef0);
-         deemphasis_block(t1, x1+j, mv1, coef0);
-         for (k=0;k<DEEMPH_BLOCK;k++)
-         {
-            pcm[2*(j+k)  ] = SIG2RES(t0[k]);
-            pcm[2*(j+k)+1] = SIG2RES(t1[k]);
-         }
-      }
-      m0 = mv0[0];
-      m1 = mv1[0];
-   }
-#endif
-   for (;j<N;j++)
+   for (j=0;j<N;j++)
    {
       celt_sig tmp0, tmp1;
       /* Add VERY_SMALL to x[] first to reduce dependency chain. */
@@ -428,6 +434,7 @@ void deemphasis_stereo_simple_c(celt_sig *in[], opus_res *pcm, int N, opus_val16
    }
    mem[0] = m0;
    mem[1] = m1;
+#endif
 }
 
 #ifndef RESYNTH
@@ -501,28 +508,7 @@ void deemphasis(celt_sig *in[], opus_res *pcm, int N, int C, int downsample, con
          /* Shortcut for the standard (non-custom modes) case */
          if (accum)
          {
-            j=0;
-#ifndef FIXED_POINT
-            {
-               celt_sig mv[DEEMPH_BLOCK];
-               deemphasis_carry(mv, m, coef0);
-               for (;j+DEEMPH_BLOCK<=N;j+=DEEMPH_BLOCK)
-               {
-                  celt_sig t[DEEMPH_BLOCK];
-                  int k;
-                  deemphasis_block(t, x+j, mv, coef0);
-                  for (k=0;k<DEEMPH_BLOCK;k++)
-                     y[(j+k)*C] = ADD_RES(y[(j+k)*C], SIG2RES(t[k]));
-               }
-               m = mv[0];
-            }
-#endif
-            for (;j<N;j++)
-            {
-               celt_sig tmp = SATURATE(x[j] + m + VERY_SMALL, SIG_SAT);
-               m = MULT16_32_Q15(coef0, tmp);
-               y[j*C] = ADD_RES(y[j*C], SIG2RES(tmp));
-            }
+            m = deemph_loop(y, x, m, coef0, N, C, 1);
          } else if (C == 1)
          {
             /* Mono: contiguous output, dispatch through celt_deemphasis()
@@ -530,28 +516,7 @@ void deemphasis(celt_sig *in[], opus_res *pcm, int N, int C, int downsample, con
             m = celt_deemphasis(y, x, coef0, m, N, arch);
          } else
          {
-            j=0;
-#ifndef FIXED_POINT
-            {
-               celt_sig mv[DEEMPH_BLOCK];
-               deemphasis_carry(mv, m, coef0);
-               for (;j+DEEMPH_BLOCK<=N;j+=DEEMPH_BLOCK)
-               {
-                  celt_sig t[DEEMPH_BLOCK];
-                  int k;
-                  deemphasis_block(t, x+j, mv, coef0);
-                  for (k=0;k<DEEMPH_BLOCK;k++)
-                     y[(j+k)*C] = SIG2RES(t[k]);
-               }
-               m = mv[0];
-            }
-#endif
-            for (;j<N;j++)
-            {
-               celt_sig tmp = SATURATE(x[j] + VERY_SMALL + m, SIG_SAT);
-               m = MULT16_32_Q15(coef0, tmp);
-               y[j*C] = SIG2RES(tmp);
-            }
+            m = deemph_loop(y, x, m, coef0, N, C, 0);
          }
       }
       mem[c] = m;
